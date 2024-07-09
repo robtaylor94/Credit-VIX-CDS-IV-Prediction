@@ -5,21 +5,22 @@ Estimation of Implied Vol levels with the following predictors:
 
 ### Random Forest Rankings for Financial Instruments
 
-| **Index** | **Financial Instrument** | **Random Forest Rank** |
-|-----------|--------------------------|------------------------|
-| 10        | TCRS Term Structure_price                   | 0.268205               |
-| 4         | Euribor c2 Futures Historical Data_price    | 0.164056               |
-| 26        | XTC5 iTraxx Cross_price_volatility          | 0.127822               |
-| 8         | ISSUSW Equities Global_price                | 0.106483               |
-| 2         | EUNK Equities Europe_price                  | 0.071333               |
-| 11        | VSTOXX 50 Volatility_price                  | 0.049106               |
-| 20        | IEAC Bonds Europe_price_volatility          | 0.039995               |
-| 24        | TCRS Term Structure_price_volatility        | 0.035295               |
-| 12        | XTC5 iTraxx Cross_price                     | 0.026593               |
-| 18        | Euribor c2 Futures Historical Data_price_volatility | 0.014999               |
-| 0         | 0GGH Bonds Global_price                     | 0.012955               |
-| 21        | IEAC Bonds Europe_volume_volatility         | 0.011155               |
-| 6         | IEAC Bonds Europe_price                     | 0.006937               |
-| 14        | 0GGH Bonds Global_price_volatility          | 0.005274               |
-| 25        | VSTOXX 50 Volatility_price_volatility       | 0.004162               |
-| 16        | EUNK Equities Europe_price_volatility       | 0.006134               |
+Chosen features via random forest, fitted on subset of a universe of ETFs and Indices range: (01/11/22 - 18/07/23)
+
+| Rank | Feature Description                                              | Value |
+|------|------------------------------------------------------------------|-------|
+| 0    | Euro Stoxx 50 Implied Vol                                        | 0.162 |
+| 1    | Term Structure of European Credit Spreads                        | 0.120 |
+| 2    | Global Investment Grade Corporate Bonds Volatility               | 0.081 |
+| 3    | iTraxx Europe Main CDS Price                                     | 0.065 |
+| 4    | European Equities Index Level                                    | 0.051 |
+| 5    | iTraxx Europe Crossover CDS Price                                | 0.043 |
+| 6    | Volatility of Euro Stoxx 50 Implied Volatility                   | 0.042 |
+| 7    | Global Developed Equities Index Volatility                       | 0.035 |
+| 8    | Historical Stock Price Volatility of SXRP ETF                    | 0.033 |
+| 9    | Volatility of STOOQ EUR Index                                    | 0.026 |
+| 10   | Volume of Euribor 2-Month Futures                                | 0.025 |
+| 11   | Volume of iTraxx Crossover CDS                                   | 0.023 |
+| 12   | Realised Vol of iTraxx Europe Main Index                         | 0.023 |
+| 13   | Volatility of iTraxx Crossover Index                             | 0.021 |
+| 14   | Volume of Euro Short-Term Rate Futures Historical Data           | 0.019 |
