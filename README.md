@@ -2,6 +2,8 @@
 
 # NOTICE: Params and models will undergo significant updates from time to time. old params from time series split are less effective for walk forward and underwent significant change.
 
+## Final tests will be done on 2024 data.
+
 MSc Project
 
 Estimation of Implied Vol levels with the following predictors:
