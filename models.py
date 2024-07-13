@@ -3,8 +3,10 @@ import pandas as pd
 import tensorflow as tf
 import itertools
 import lightgbm as lgb
+import math
 from keras.models import Model
-from keras.layers import Dense, GRU, Dropout, Bidirectional, LayerNormalization, Input, Add, Conv1D
+from keras.regularizers import l1_l2
+from keras.layers import Dense, GRU, Dropout, Bidirectional, LayerNormalization, Input, Add, Conv1D, BatchNormalization
 from keras.optimizers import Adam
 from keras.callbacks import EarlyStopping, ReduceLROnPlateau, Callback
 from sklearn.feature_selection import SelectKBest, f_regression
@@ -28,7 +30,7 @@ class DataPreparation:
             original_dates = pd.RangeIndex(start=0, stop=len(X), step=1)
 
         # print original dimensions of X and y pre-transformation
-        print(f"X dims pre-sequiencing: {X.shape}")
+        print(f"X dims pre-sequencing: {X.shape}")
         print(f"y dims pre-sequencing: {y.shape}")
 
         X_values = np.array(X)
@@ -96,7 +98,6 @@ class DataPreparation:
 
         return X_scaled, y_scaled
 
-
     def inverse_transform_y(self, y):
         if isinstance(y, pd.Series):
             y_inv = self.scaler_y.inverse_transform(y.values.reshape(-1, 1)).flatten()
@@ -123,41 +124,6 @@ class WalkForwardValidation:
 
             yield (X_train, y_train), (X_test, y_test)
 
-class AR_SVM:
-    """autoregressive SVM, featured extensively in vol literature"""
-    def __init__(self, time_steps=15, n_splits=5):
-        self.time_steps = time_steps
-        self.param_grid = {
-            'kernel': ['linear', 'poly', 'rbf', 'sigmoid'],
-            'C': [0.1, 1, 10, 100],
-            'epsilon': [0.01, 0.1, 0.2, 0.5]
-        }
-        self.scorer = make_scorer(mean_absolute_error, greater_is_better=False)
-        self.best_svr = None
-        self.scaler = MinMaxScaler()
-        self.validator = WalkForwardValidation(n_splits)
-
-    def prepare_training_data(self, X, y):
-        X_scaled = self.scaler.fit_transform(X)
-        return X_scaled, y
-
-    def fit(self, X, y):
-        X_scaled, y = self.prepare_training_data(X, y)
-        errors = self.validator.validate(GridSearchCV(SVR(), self.param_grid, scoring=self.scorer, cv=2, verbose=1, n_jobs=-1), X_scaled, y)
-        print(f"walk-forward validation errors: {errors}")
-        print(f"mean validation error: {np.mean(errors)}")
-
-        grid_search = GridSearchCV(SVR(), self.param_grid, scoring=self.scorer, cv=2, verbose=1, n_jobs=-1)
-        grid_search.fit(X_scaled, y)
-        self.best_svr = grid_search.best_estimator_
-        print(f"best params: {grid_search.best_params_}")
-
-    def predict(self, X):
-        if not self.best_svr:
-            raise AttributeError("model has not been fitted yet.")
-        X_scaled = self.scaler.transform(X)
-        return self.best_svr.predict(X_scaled)
-
 class Naive:
     def __init__(self):
         self.last_y = None  # only need to store the last observed y as prediction of y_T+1
@@ -177,103 +143,70 @@ class SVM:
         self.n_features = n_features
         self.param_grid = {
             'kernel': ['linear', 'poly', 'rbf', 'sigmoid'],
-            'C': [5, 10, 20],
-            'epsilon': [0.05, 0.1, 0.2],
-            'gamma': ['scale', 'auto', 0.05, 0.1, 0.2]
+            'C': [15], # regularisaiton param, keep low.
+            'epsilon': [0.01, 0.05, 0.1],
+            'gamma': ['scale', 'auto', 0.05, 0.1, 0.15]
         }
         self.scorer = make_scorer(mean_squared_error, greater_is_better=False)
         self.best_svr = None
         self.feature_selector = None
         self.data_prep = DataPreparation(self.sequence_length)
         self.validator = WalkForwardValidation(sequence_length=self.sequence_length)
-        self.X_seq = None  # store the last sequence for testing or prediction
+        self.X_seq = None
 
-    def fit(self, X: np.ndarray, y: np.ndarray, params: dict = None):
+    def fit(self, X, y, params=None):
         if params:
             self.set_params(params)
-
         X_seq, y_seq = self.data_prep.create_sequences(X, y, is_3d=False)
-        self.X_seq = X_seq  # store the sequenced data for potential future predictions
-
+        self.X_seq = X_seq
         best_score = float('inf')
         best_params = None
-
         param_combinations = list(itertools.product(
             self.param_grid['kernel'],
             self.param_grid['C'],
             self.param_grid['epsilon'],
             self.param_grid['gamma']
         ))
-
-        try:
-            for kernel, C, epsilon, gamma in param_combinations:
-                total_score = 0
-                count = 0
-
-                for (X_train, y_train), (X_test, y_test) in self.validator.validate(self, X_seq, y_seq):
-                    if len(X_train) == 0 or len(X_test) == 0:
-                        print('Empty training or testing set, skipping.')
-                        continue
-
-                    X_train_scaled, y_train_scaled = self.data_prep.scale_data(X_train, y_train)
-                    X_test_scaled, _ = self.data_prep.scale_data(X_test, y_test)
-
-                    if self.feature_selection:
-                        self.feature_selector = SelectKBest(f_regression, k=self.n_features)
-                        X_selected = self.feature_selector.fit_transform(X_train_scaled, y_train_scaled)
-                    else:
-                        X_selected = X_train_scaled
-
-                    model = SVR(kernel=kernel, C=C, epsilon=epsilon, gamma=gamma)
-                    model.fit(X_selected, y_train_scaled.ravel())
-
-                    y_pred = model.predict(X_test_scaled)
-                    score = mean_squared_error(y_test, y_pred)
-
-                    total_score += score
-                    count += 1
-
-                avg_score = total_score / count if count > 0 else float('inf')
-
-                if avg_score < best_score:
-                    best_score = avg_score
-                    best_params = {'kernel': kernel, 'C': C, 'epsilon': epsilon, 'gamma': gamma}
-                    self.best_svr = model  # update the best model within the parameter testing loop
-
-            self.last_params = best_params
-            print(f'Best params found: {best_params} with score {best_score}')
-            if self.best_svr is not None:
-                print("Model is properly fitted and ready for prediction.")
-            else:
-                print("Failed to fit any model.")
-
-        except Exception as e:
-            print(f"An error occurred during fit: {e}")
+        for kernel, C, epsilon, gamma in param_combinations:
+            total_score = 0
+            count = 0
+            for (X_train, y_train), (X_test, y_test) in self.validator.validate(self, X_seq, y_seq):
+                if len(X_train) == 0 or len(X_test) == 0:
+                    continue
+                X_train_scaled, y_train_scaled = self.data_prep.scale_data(X_train, y_train)
+                X_test_scaled, _ = self.data_prep.scale_data(X_test, y_test)
+                if self.feature_selection:
+                    self.feature_selector = SelectKBest(f_regression, k=self.n_features)
+                    X_selected = self.feature_selector.fit_transform(X_train_scaled, y_train_scaled)
+                else:
+                    X_selected = X_train_scaled
+                model = SVR(kernel=kernel, C=C, epsilon=epsilon, gamma=gamma)
+                model.fit(X_selected, y_train_scaled.ravel())
+                y_pred = model.predict(X_test_scaled)
+                score = mean_squared_error(y_test, y_pred)
+                total_score += score
+                count += 1
+            avg_score = total_score / count if count > 0 else float('inf')
+            if avg_score < best_score:
+                best_score = avg_score
+                best_params = {'kernel': kernel, 'C': C, 'epsilon': epsilon, 'gamma': gamma}
+                self.best_svr = model
+        self.last_params = best_params
+        print(f'Best params found: {best_params} with score {best_score}')
 
     def predict(self):
         if not self.best_svr:
             print("Model has not been fitted yet or failed to fit properly.")
-            return np.array([np.nan])[0]  # return a single NaN
-
-        try:
-            X_seq = self.X_seq.iloc[-1].values.reshape(1, -1)
-            X_seq_scaled = self.data_prep.scaler_X.transform(X_seq)
-
-            if self.feature_selection and self.feature_selector is not None:
-                X_selected = self.feature_selector.transform(X_seq_scaled)
-            else:
-                X_selected = X_seq_scaled
-
-            forecast_scaled = self.best_svr.predict(X_selected)
-            forecast = self.data_prep.inverse_transform_y(forecast_scaled)[0]
-
-            return np.array([forecast])[0]  # return a single numpy value
-
-        except Exception as e:
-            print(f"Prediction failed: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return np.array([np.nan])[0]  # return a single NaN
+            return np.array([np.nan])[0]
+        X_seq = self.X_seq.iloc[-1].values.reshape(1, -1)
+        X_seq_scaled = self.data_prep.scaler_X.transform(X_seq)
+        if self.feature_selection and self.feature_selector is not None:
+            X_selected = self.feature_selector.transform(X_seq_scaled)
+        else:
+            X_selected = X_seq_scaled
+        forecast_scaled = self.best_svr.predict(X_selected)
+        forecast = self.data_prep.inverse_transform_y(forecast_scaled)[0]
+        return np.array([forecast])[0]
 
 class TFT_GRU:
     def __init__(self, time_steps=40, sequence_length=4):
@@ -284,137 +217,117 @@ class TFT_GRU:
         self.validator = WalkForwardValidation(sequence_length=self.sequence_length)
 
     def build_model(self, input_shape, sequence_length):
-        print(f"Building model with input shape: {input_shape} and sequence length: {sequence_length}")
         inputs = Input(shape=(sequence_length, input_shape))
-        
-        x = Conv1D(filters=64, kernel_size=2, padding='same')(inputs)
-        print(f"Shape after Conv1D: {x.shape}")
-        attention = self.attention_mechanism(x, head_size=16, num_heads=4)
-        print(f"Shape after attention: {attention.shape}")
-        
-        attention = Conv1D(filters=64, kernel_size=1, padding='same')(attention)
-        
-        x = Add()([x, attention])
+
+        # CNN filter for local feature extraction
+        adjusted_inputs = Conv1D(filters=64, kernel_size=2, padding='same')(inputs)
+
+        # Multi-headed attention
+        attention = self.multi_head_attention_layer(adjusted_inputs, head_size=16, num_heads=4)
+        attention = Conv1D(filters=64, kernel_size=2, padding='same')(attention)
+        x = Add()([adjusted_inputs, attention])
         x = LayerNormalization()(x)
         x = Dense(64, activation='relu')(x)
         x = Dropout(0.2)(x)
-        
-        # residual connection
-        residual = Conv1D(filters=64, kernel_size=1, padding='same')(inputs)
-        x = Add()([x, residual])
+        x = Add()([adjusted_inputs, x])
         x = LayerNormalization()(x)
-        
-        x = Bidirectional(GRU(64, return_sequences=True))(x)
+
+        # GRU layers
+        x = Bidirectional(GRU(64, activation='tanh', recurrent_activation='sigmoid', return_sequences=True))(x)
         x = LayerNormalization()(x)
         x = Dropout(0.2)(x)
-        x = Bidirectional(GRU(32, return_sequences=False))(x)
+        x = Bidirectional(GRU(32, activation='tanh', recurrent_activation='sigmoid', return_sequences=False))(x)
         x = LayerNormalization()(x)
         x = Dropout(0.2)(x)
-        
+
         x = Dense(32, activation='selu')(x)
         output = Dense(1)(x)
 
         self.model = Model(inputs=inputs, outputs=output)
-        self.model.compile(optimizer=Adam(learning_rate=0.0001), loss='mean_squared_error')
+        self.model.compile(optimizer=Adam(learning_rate=0.001), loss='mean_squared_error')
 
-    def attention_mechanism(self, inputs, head_size, num_heads):
+    def multi_head_attention_layer(self, inputs, head_size, num_heads):
         query = Dense(head_size * num_heads)(inputs)
         key = Dense(head_size * num_heads)(inputs)
         value = Dense(head_size * num_heads)(inputs)
+
         query = tf.split(query, num_heads, axis=-1)
         key = tf.split(key, num_heads, axis=-1)
         value = tf.split(value, num_heads, axis=-1)
 
-        attention_outputs = [
-            tf.matmul(tf.nn.softmax(tf.matmul(q, k, transpose_b=True) / tf.sqrt(tf.cast(head_size, tf.float32)), axis=-1), v)
-            for q, k, v in zip(query, key, value)
-        ]
+        attention_outputs = []
+        for q, k, v in zip(query, key, value):
+            attention_score = tf.matmul(q, k, transpose_b=True) / tf.sqrt(tf.cast(head_size, tf.float32))
+            attention_weights = tf.nn.softmax(attention_score, axis=-1)
+            attention_output = tf.matmul(attention_weights, v)
+            attention_outputs.append(attention_output)
 
         concat_attention = tf.concat(attention_outputs, axis=-1)
-        return Dense(inputs.shape[-1])(concat_attention)
+        output = Dense(inputs.shape[-1])(concat_attention)
+
+        return output
+
+    def calculate_epochs(self, steps, a=100, b=0.1):  # inverse proportionality for epochs
+        return int(math.ceil(a / (1 + b * steps)))
 
     def fit(self, X, y):
         X_seq, y_seq = self.data_prep.create_sequences(X, y, is_3d=True)
-        print(f"Data prepared: X_seq shape {X_seq.shape}, y_seq shape {y_seq.shape}")
-        self.X_seq = X_seq  # store the sequenced data for potential future predictions
-
-        self.X_train = X_seq
-        self.y_train = y_seq
-
+        self.X_seq = np.array(X_seq)
+        self.X_train = np.array(X_seq)
+        self.y_train = np.array(y_seq)
         if self.model is None:
             self.build_model(X.shape[1], self.sequence_length)
-
-        early_stopping = EarlyStopping(monitor='loss', patience=10, restore_best_weights=True)
-        reduce_lr = ReduceLROnPlateau(monitor='loss', factor=0.5, patience=5, min_lr=0.00001)
-
+        early_stopping = EarlyStopping(monitor='loss', patience=5, restore_best_weights=True)
+        reduce_lr = ReduceLROnPlateau(monitor='loss', factor=0.5, patience=2, min_lr=0.01)
         total_score = 0
         count = 0
 
-        for (X_train, y_train), (X_test, y_test) in self.validator.validate(self, X_seq, y_seq):
+        validation_steps = len(list(self.validator.validate(self, X_seq, y_seq)))
+        epochs = self.calculate_epochs(validation_steps)
+
+        for i, ((X_train, y_train), (X_test, y_test)) in enumerate(self.validator.validate(self, X_seq, y_seq)):
             if len(X_train) == 0 or len(X_test) == 0:
-                print('Empty training or testing set, skipping.')
                 continue
+            
+            print(f"Step {i+1}: Training on {len(X_train)} samples, Validating on {len(X_test)} samples")
 
-            print(f"Current data types before scaling: X_train type: {type(X_train)}, y_train type: {type(y_train)}")
-            print(f"Current data shapes before scaling: X_train shape: {X_train.shape}, y_train shape: {y_train.shape}")
-
-            # fit scaler on the training data
             X_train_scaled, y_train_scaled = self.data_prep.scale_data(X_train, y_train)
-
-            # ensure X_test and y_test are numpy arrays
-            X_test_reshaped = X_test.values.reshape(-1, X_test.shape[-1]) if isinstance(X_test, pd.DataFrame) else X_test.reshape(-1, X_test.shape[-1])
-            y_test_reshaped = y_test.values.reshape(-1, 1) if isinstance(y_test, pd.Series) else y_test.reshape(-1, 1)
-
-            X_test_scaled = self.data_prep.scaler_X.transform(X_test_reshaped).reshape(X_test.shape)
-            y_test_scaled = self.data_prep.scaler_y.transform(y_test_reshaped).reshape(-1)
-
-            print(f"Shapes for model fitting: X_train_scaled={X_train_scaled.shape}, y_train_scaled={y_train_scaled.shape}")
+            X_test_scaled, y_test_scaled = self.data_prep.scale_data(X_test, y_test)
             self.model.fit(
-                X_train_scaled, y_train_scaled,
-                epochs=100, batch_size=64, verbose=1,
+                np.array(X_train_scaled), np.array(y_train_scaled),
+                validation_data=(np.array(X_test_scaled), np.array(y_test_scaled)),
+                epochs=epochs, batch_size=64, verbose=1,
                 callbacks=[early_stopping, reduce_lr]
             )
-
-            y_pred_scaled = self.model.predict(X_test_scaled)
-            y_pred = self.data_prep.scaler_y.inverse_transform(y_pred_scaled.reshape(-1, 1)).flatten()
-
-            y_test_original = self.data_prep.scaler_y.inverse_transform(y_test_scaled.reshape(-1, 1)).flatten()
+            y_pred_scaled = self.model.predict(np.array(X_test_scaled))
+            y_pred_scaled = np.array(y_pred_scaled)
+            y_pred = np.array(self.data_prep.inverse_transform_y(y_pred_scaled.reshape(-1, 1))).flatten()
+            y_test_scaled = np.array(y_test_scaled)
+            y_test_original = np.array(self.data_prep.inverse_transform_y(y_test_scaled.reshape(-1, 1))).flatten()
             score = mean_squared_error(y_test_original, y_pred)
-
             total_score += score
             count += 1
 
+            print(f"Step {i+1} Validation MSE: {score}")
+
         avg_score = total_score / count if count > 0 else float('inf')
         print(f"Mean validation error: {avg_score}")
-
-        # fit the model on whole chunk
         X_seq_scaled, y_seq_scaled = self.data_prep.scale_data(X_seq, y_seq)
         self.model.fit(
-            X_seq_scaled, y_seq_scaled,
-            epochs=100, batch_size=64, verbose=1,
+            np.array(X_seq_scaled), np.array(y_seq_scaled),
+            epochs=epochs, batch_size=64, verbose=1,
             callbacks=[early_stopping, reduce_lr]
         )
 
     def predict(self):
         if self.model is None:
             raise AttributeError("Model has not been fitted yet.")
-
-        X_input = self.X_train[-1:]
-        print(f"Predicting with last input shape: {X_input.shape}")
-
-        X_input_scaled = self.data_prep.scaler_X.transform(X_input.reshape(-1, X_input.shape[-1])).reshape(X_input.shape)
-        print(f"Scaled input shape: {X_input_scaled.shape}")
-        
+        X_input = np.array(self.X_seq[-1]).reshape(1, self.sequence_length, -1)
+        X_input_reshaped = X_input.reshape(-1, X_input.shape[-1])
+        X_input_scaled = self.data_prep.scaler_X.transform(X_input_reshaped).reshape(X_input.shape)
         forecast_scaled = self.model.predict(X_input_scaled)
-        print(f"Raw scaled forecast: {forecast_scaled}")
-        
-        forecast = self.data_prep.inverse_transform_y(forecast_scaled.reshape(-1, 1)).flatten()
-        print(f"Final forecast: {forecast}")
-        
-        if np.isnan(forecast).any():
-            print("Warning: NaN values in forecast")
-        
-        return forecast[0]  # return a single numpy value
+        forecast = self.data_prep.inverse_transform_y(forecast_scaled)
+        return forecast[0]
 
 class LGBM:
     def __init__(self, sequence_length=4):
