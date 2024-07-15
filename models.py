@@ -4,16 +4,16 @@ import tensorflow as tf
 import itertools
 import lightgbm as lgb
 import math
-from keras.models import Model
-from keras.regularizers import l1_l2
-from keras.layers import Dense, GRU, Dropout, Bidirectional, LayerNormalization, Input, Add, Conv1D, BatchNormalization
-from keras.optimizers import Adam
-from keras.callbacks import EarlyStopping, ReduceLROnPlateau, Callback
 from sklearn.feature_selection import SelectKBest, f_regression
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
 from sklearn.metrics import mean_absolute_error, make_scorer, mean_squared_error
 from sklearn.svm import SVR
+from tensorflow.keras.layers import Input, Conv1D, Add, LayerNormalization, Dense, Dropout, Bidirectional, GRU
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.activations import swish
 
 class DataPreparation:
     def __init__(self, sequence_length):
@@ -143,7 +143,6 @@ class SVM:
         self.n_features = n_features
         self.param_grid = {
             'kernel': ['linear', 'poly', 'rbf', 'sigmoid'],
-            'C': [15], # regularisaiton param, keep low.
             'epsilon': [0.01, 0.05, 0.1],
             'gamma': ['scale', 'auto', 0.05, 0.1, 0.15]
         }
@@ -163,11 +162,10 @@ class SVM:
         best_params = None
         param_combinations = list(itertools.product(
             self.param_grid['kernel'],
-            self.param_grid['C'],
             self.param_grid['epsilon'],
             self.param_grid['gamma']
         ))
-        for kernel, C, epsilon, gamma in param_combinations:
+        for kernel, epsilon, gamma in param_combinations:
             total_score = 0
             count = 0
             for (X_train, y_train), (X_test, y_test) in self.validator.validate(self, X_seq, y_seq):
@@ -180,7 +178,7 @@ class SVM:
                     X_selected = self.feature_selector.fit_transform(X_train_scaled, y_train_scaled)
                 else:
                     X_selected = X_train_scaled
-                model = SVR(kernel=kernel, C=C, epsilon=epsilon, gamma=gamma)
+                model = SVR(kernel=kernel, epsilon=epsilon, gamma=gamma)
                 model.fit(X_selected, y_train_scaled.ravel())
                 y_pred = model.predict(X_test_scaled)
                 score = mean_squared_error(y_test, y_pred)
@@ -189,7 +187,7 @@ class SVM:
             avg_score = total_score / count if count > 0 else float('inf')
             if avg_score < best_score:
                 best_score = avg_score
-                best_params = {'kernel': kernel, 'C': C, 'epsilon': epsilon, 'gamma': gamma}
+                best_params = {'kernel': kernel, 'epsilon': epsilon, 'gamma': gamma}
                 self.best_svr = model
         self.last_params = best_params
         print(f'Best params found: {best_params} with score {best_score}')
@@ -220,33 +218,33 @@ class TFT_GRU:
         inputs = Input(shape=(sequence_length, input_shape))
 
         # CNN filter for local feature extraction
-        adjusted_inputs = Conv1D(filters=64, kernel_size=2, padding='same')(inputs)
+        adjusted_inputs = Conv1D(filters=64, kernel_size=2, padding='same', activation=swish)(inputs)
 
         # Multi-headed attention
-        attention = self.multi_head_attention_layer(adjusted_inputs, head_size=16, num_heads=4)
-        attention = Conv1D(filters=64, kernel_size=2, padding='same')(attention)
+        attention = self.attention_layer(adjusted_inputs, head_size=16, num_heads=4)
+        attention = Conv1D(filters=64, kernel_size=2, padding='same', activation=swish)(attention)
         x = Add()([adjusted_inputs, attention])
         x = LayerNormalization()(x)
-        x = Dense(64, activation='relu')(x)
+        x = Dense(64, activation=swish)(x)
         x = Dropout(0.2)(x)
         x = Add()([adjusted_inputs, x])
         x = LayerNormalization()(x)
 
         # GRU layers
-        x = Bidirectional(GRU(64, activation='tanh', recurrent_activation='sigmoid', return_sequences=True))(x)
+        x = Bidirectional(GRU(64, activation=swish, recurrent_activation='sigmoid', return_sequences=True))(x)
         x = LayerNormalization()(x)
         x = Dropout(0.2)(x)
-        x = Bidirectional(GRU(32, activation='tanh', recurrent_activation='sigmoid', return_sequences=False))(x)
+        x = Bidirectional(GRU(32, activation=swish, recurrent_activation='sigmoid', return_sequences=False))(x)
         x = LayerNormalization()(x)
         x = Dropout(0.2)(x)
 
-        x = Dense(32, activation='selu')(x)
+        x = Dense(32, activation=swish)(x)
         output = Dense(1)(x)
 
         self.model = Model(inputs=inputs, outputs=output)
-        self.model.compile(optimizer=Adam(learning_rate=0.001), loss='mean_squared_error')
+        self.model.compile(optimizer=Adam(learning_rate=0.01), loss='mean_squared_error')
 
-    def multi_head_attention_layer(self, inputs, head_size, num_heads):
+    def attention_layer(self, inputs, head_size, num_heads):
         query = Dense(head_size * num_heads)(inputs)
         key = Dense(head_size * num_heads)(inputs)
         value = Dense(head_size * num_heads)(inputs)
@@ -263,12 +261,12 @@ class TFT_GRU:
             attention_outputs.append(attention_output)
 
         concat_attention = tf.concat(attention_outputs, axis=-1)
-        output = Dense(inputs.shape[-1])(concat_attention)
+        output = Dense(inputs.shape[-1], activation=swish)(concat_attention)
 
         return output
 
-    def calculate_epochs(self, steps, a=100, b=0.1):  # inverse proportionality for epochs
-        return int(math.ceil(a / (1 + b * steps)))
+    def calculate_epochs(self, steps):  # inverse proportionality for epochs
+        return int(math.ceil(100 / (1 + 0.1 * steps)))
 
     def fit(self, X, y):
         X_seq, y_seq = self.data_prep.create_sequences(X, y, is_3d=True)
