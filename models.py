@@ -2,13 +2,14 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 import itertools
+import gc
 import lightgbm as lgb
 import math
 from sklearn.feature_selection import SelectKBest, f_regression
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_absolute_error, make_scorer
+from sklearn.metrics import mean_absolute_error
 from sklearn.svm import SVR
-from tensorflow.keras.layers import Input, Conv1D, Add, LayerNormalization, Dense, Dropout, Bidirectional, GRU, Lambda
+from tensorflow.keras.layers import Input, Conv1D, Add, LayerNormalization, Dense, Dropout, Bidirectional, GRU, Layer
 from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
@@ -309,108 +310,154 @@ class TFT_GRU:
         self.model = None
         self.data_prep = DataPreparation(self.sequence_length)
         self.validator = WalkForwardValidation(self.sequence_length)
+        self.X_seq = None
 
-    def build_model(self, input_shape, sequence_length):
-        inputs = Input(shape=(sequence_length, input_shape))
+    class AttentionLayer(Layer):
+        def __init__(self, head_size, num_heads, **kwargs):
+            super().__init__(**kwargs)
+            self.head_size = head_size
+            self.num_heads = num_heads
 
-        adjusted_inputs = Conv1D(filters=64, kernel_size=2, padding='same', activation=swish)(inputs)
-        attention = self.attention_layer(adjusted_inputs, head_size=16, num_heads=4)
-        attention = Conv1D(filters=64, kernel_size=2, padding='same', activation=swish)(attention)
-        x = Add()([adjusted_inputs, attention])
-        x = LayerNormalization()(x)
-        x = Dense(64, activation=swish)(x)
-        x = Dropout(0.2)(x)
-        x = Add()([adjusted_inputs, x])
-        x = LayerNormalization()(x)
+        def build(self, input_shape):
+            self.query_dense = Dense(self.head_size * self.num_heads)
+            self.key_dense = Dense(self.head_size * self.num_heads)
+            self.value_dense = Dense(self.head_size * self.num_heads)
+            self.output_dense = Dense(input_shape[-1])
 
-        x = Bidirectional(GRU(64, activation=swish, recurrent_activation='sigmoid', return_sequences=True))(x)
-        x = LayerNormalization()(x)
-        x = Dropout(0.2)(x)
-        x = Bidirectional(GRU(32, activation=swish, recurrent_activation='sigmoid', return_sequences=False))(x)
-        x = LayerNormalization()(x)
-        x = Dropout(0.2)(x)
+        def call(self, inputs):
+            query = self.query_dense(inputs)
+            key = self.key_dense(inputs)
+            value = self.value_dense(inputs)
 
-        x = Dense(32, activation=swish)(x)
-        output = Dense(1)(x)
-
-        optimizer = Adam(learning_rate=self.learning_rate, clipnorm=self.clipnorm)
-        self.model = Model(inputs=inputs, outputs=output)
-        self.model.compile(optimizer=optimizer, loss='mean_absolute_error')
-
-    def attention_layer(self, inputs, head_size, num_heads):
-        def multi_head_attention(query_key_value):
-            query, key, value = query_key_value
-            query = tf.split(query, num_heads, axis=-1)
-            key = tf.split(key, num_heads, axis=-1)
-            value = tf.split(value, num_heads, axis=-1)
+            query = tf.split(query, self.num_heads, axis=-1)
+            key = tf.split(key, self.num_heads, axis=-1)
+            value = tf.split(value, self.num_heads, axis=-1)
 
             attention_outputs = []
             for q, k, v in zip(query, key, value):
-                attention_score = tf.matmul(q, k, transpose_b=True) / tf.sqrt(tf.cast(head_size, tf.float32))
+                attention_score = tf.matmul(q, k, transpose_b=True) / tf.sqrt(tf.cast(self.head_size, tf.float32))
                 attention_weights = tf.nn.softmax(attention_score, axis=-1)
                 attention_output = tf.matmul(attention_weights, v)
                 attention_outputs.append(attention_output)
 
             concat_attention = tf.concat(attention_outputs, axis=-1)
-            return concat_attention
+            output = self.output_dense(concat_attention)
 
-        query = Dense(head_size * num_heads)(inputs)
-        key = Dense(head_size * num_heads)(inputs)
-        value = Dense(head_size * num_heads)(inputs)
+            return output
 
-        attention_output = Lambda(multi_head_attention)([query, key, value])
-        output = Dense(inputs.shape[-1], activation=swish)(attention_output)
+    def build_model(self, input_shape, sequence_length):
+        inputs = Input(shape=(sequence_length, input_shape))
 
-        return output
+        adjusted_inputs = Conv1D(filters=64, kernel_size=2, padding='same', activation='swish')(inputs)
+        attention = self.AttentionLayer(head_size=16, num_heads=4)(adjusted_inputs)
+        attention = Conv1D(filters=64, kernel_size=2, padding='same', activation='swish')(attention)
+        x = Add()([adjusted_inputs, attention])
+        x = LayerNormalization()(x)
+        x = Dense(64, activation='swish')(x)
+        x = Dropout(0.2)(x)
+        x = Add()([adjusted_inputs, x])
+        x = LayerNormalization()(x)
+
+        x = Bidirectional(GRU(64, activation='swish', recurrent_activation='sigmoid', return_sequences=True))(x)
+        x = LayerNormalization()(x)
+        x = Dropout(0.2)(x)
+        x = Bidirectional(GRU(32, activation='swish', recurrent_activation='sigmoid', return_sequences=False))(x)
+        x = LayerNormalization()(x)
+        x = Dropout(0.2)(x)
+
+        x = Dense(32, activation='swish')(x)
+        output = Dense(1)(x)
+
+        optimizer = Adam(learning_rate=self.learning_rate, clipnorm=self.clipnorm)
+        self.model = Model(inputs=inputs, outputs=output)
+        self.model.compile(optimizer=optimizer, loss='mean_absolute_error')
+    
+    def cleanup(self):
+        """Clean up all resources"""
+        if self.model is not None:
+            del self.model
+            self.model = None
+        if hasattr(self, 'data_prep') and self.data_prep is not None:
+            self.data_prep = None
+        if hasattr(self, 'validator') and self.validator is not None:
+            self.validator = None
+        if self.X_seq is not None:
+            del self.X_seq
+            self.X_seq = None
+
+        tf.keras.backend.clear_session(free_memory=True)
+        gc.collect()
 
     def fit(self, X, y):
+        # Ensure the usage of GPU if available
+        gpus = tf.config.experimental.list_physical_devices('GPU')
+        if gpus:
+            try:
+                tf.config.experimental.set_memory_growth(gpus[0], True)
+                tf.config.optimizer.set_jit(False)  # Disable XLA if not needed
+            except RuntimeError as e:
+                print(e)
+
+        # Create sequences
         X_seq, y_seq = self.data_prep.create_sequences(X, y, is_3d=True)
         self.X_seq = np.array(X_seq)
+        
+        # Ensure model is built
         if self.model is None:
             self.build_model(X_seq.shape[-1], self.sequence_length)
 
+        # Callbacks
         early_stopping = EarlyStopping(monitor='loss', patience=5, restore_best_weights=True)
         reduce_lr = ReduceLROnPlateau(monitor='loss', factor=0.5, patience=2, min_lr=0.001)
 
+        # Walk-forward validation
         for i, ((X_train, y_train), (X_test, y_test)) in enumerate(self.validator.validate(X_seq, y_seq)):
             if len(X_train) == 0 or len(X_test) == 0:
                 continue
 
-            # apply noise to the training data
+            # Add noise and scale data
             X_train_noised = uniform_noise(X_train)
             X_train_scaled, y_train_scaled = self.data_prep.scale_data(X_train_noised, y_train)
-            
             X_test_scaled, y_test_scaled = self.data_prep.scale_data(X_test, y_test)
 
-            self.model.fit(
-                X_train_scaled, y_train_scaled,
-                validation_data=(X_test_scaled, y_test_scaled),
-                epochs=15, batch_size=64, verbose=1,
-                callbacks=[early_stopping, reduce_lr]
-            )
+            # Train model
+            with tf.device('/device:GPU:0'):
+                self.model.fit(
+                    X_train_scaled, y_train_scaled,
+                    validation_data=(X_test_scaled, y_test_scaled),
+                    epochs=15, batch_size=64, verbose=1,
+                    callbacks=[early_stopping, reduce_lr]
+                )
 
+            # Validation MAE
             y_pred_scaled = self.model.predict(X_test_scaled)
             y_pred = self.data_prep.inverse_transform_y(pd.Series(y_pred_scaled.flatten())).to_numpy().flatten()
             y_test_original = y_test.to_numpy().flatten()
             mae = mean_absolute_error(y_test_original, y_pred)
             print(f"Step {i+1} Validation MAE: {mae}")
 
-        # final train
+        # final training
         X_seq_noised = uniform_noise(X_seq)
         X_seq_scaled, y_seq_scaled = self.data_prep.scale_data(X_seq_noised, y_seq)
-        self.model.fit(
-            X_seq_scaled, y_seq_scaled,
-            epochs=15, batch_size=64, verbose=1,
-            callbacks=[early_stopping, reduce_lr]
-        )
+        with tf.device('/device:GPU:0'):
+            self.model.fit(
+                X_seq_scaled, y_seq_scaled,
+                epochs=15, batch_size=64, verbose=1,
+                callbacks=[early_stopping, reduce_lr]
+            )
 
     def predict(self):
-        if self.model is None:
-            raise AttributeError("Model has not been fitted yet.")
         X_input = self.X_seq[-1].reshape(1, self.sequence_length, -1)
         X_input_scaled = self.data_prep.scaler_X.transform(X_input.reshape(-1, X_input.shape[-1])).reshape(1, self.sequence_length, -1)
-        forecast_scaled = self.model.predict(X_input_scaled)
+        with tf.device('/device:GPU:0'):
+            forecast_scaled = self.model.predict(X_input_scaled)
         forecast = self.data_prep.inverse_transform_y(forecast_scaled)
+
+        del X_input, X_input_scaled, forecast_scaled
+        gc.collect()
+        self.cleanup()
+        gc.collect()
+
         return forecast[0]
 
 class Naive:
@@ -420,7 +467,7 @@ class Naive:
     def fit(self, X, y):
         self.last_y = y[-1, 0] if y.ndim > 1 else y[-1]
 
-    def predict(self):
+    def predict(self, X=None):
         if self.last_y is None:
             raise ValueError("Model has not been fitted yet.")
         return np.array([self.last_y])[0]
