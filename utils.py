@@ -1,15 +1,15 @@
+import gc
+import traceback
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from statsmodels.tsa.stattools import acf
-from scipy.stats import norm
-from sklearn.metrics import mean_absolute_error
-import traceback
+import seaborn as sns
 import tensorflow as tf
 from loguru import logger
-import matplotlib.pyplot as plt
-import seaborn as sns
-import matplotlib.dates as mdates
 from matplotlib.ticker import FixedLocator, FixedFormatter
+from scipy.stats import norm
+from statsmodels.tsa.stattools import acf
 
 def diebold_mariano_test(errors, naive_errors, h=1, alpha=0.05):
     # calc differences
@@ -73,12 +73,13 @@ def reconstruct_levels(target_vector, results):
     }
 
 def rolling_test(model_class, feature_matrix, feature_vector, chunk, predictions, sequence_length=None, model_name=""):
-    # logging the start of the test
     logger.info(f'Starting {model_name} test')
-    forecasts, actuals, forecast_dates, mae_scores = [], [], [], []
+    forecasts, actuals, forecast_dates = [], [], []
     t = 0
 
-    # iterating through prediction periods
+    feature_matrix = feature_matrix.astype(np.float32)
+    feature_vector = feature_vector.astype(np.float32)
+
     while t < predictions:
         end_idx = -(predictions - t) if t != predictions - 1 else None
         start_idx = -(chunk - t) if t < chunk else None
@@ -91,29 +92,32 @@ def rolling_test(model_class, feature_matrix, feature_vector, chunk, predictions
         if y_test.empty:
             logger.info(f"No data for {t}")
             t += 1
+            del X_fit, y_fit, X_test, y_test
+            gc.collect()
             continue
 
         try:
-            # initialise and fit
             model = model_class(sequence_length=sequence_length)
             model.fit(X_fit.values, y_fit.values)
             logger.info(f'Test {t+1}/{predictions}')
             forecast = model.predict().flatten()
 
-            forecasts.append(forecast[0])
-            actuals.append(y_test.values.flatten()[0])
+            forecasts.append(round(forecast[0], 4))
+            actuals.append(round(y_test.values.flatten()[0], 4))
             forecast_dates.append(y_test.index[0])
-            mae = mean_absolute_error(y_test.values.flatten(), forecast)
-            mae_scores.append(mae)
 
         except Exception as e:
             logger.error(f"An error occurred: {traceback.format_exc()}")
 
+        finally:
+            if hasattr(model, 'cleanup'):
+                model.cleanup()
+            del model, X_fit, y_fit, X_test, y_test
+            tf.keras.backend.clear_session()
+            gc.collect()
+
         t += 1
 
-    logger.info(f"Avg. MAE: {np.mean(mae_scores)}")
-
-    # return forecasts, actuals & dates
     return {
         'forecasts': forecasts,
         'actuals': actuals,
