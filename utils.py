@@ -113,7 +113,6 @@ def rolling_test(model_class, feature_matrix, feature_vector, chunk, predictions
             if hasattr(model, 'cleanup'):
                 model.cleanup()
             del model, X_fit, y_fit, X_test, y_test
-            tf.keras.backend.clear_session()
             gc.collect()
 
         t += 1
