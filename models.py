@@ -1,19 +1,17 @@
 import numpy as np
 import pandas as pd
-import tensorflow as tf
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
 import itertools
 import gc
 import lightgbm as lgb
-import math
+from torch.utils.data import DataLoader, TensorDataset
 from sklearn.feature_selection import SelectKBest, f_regression
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_error
 from sklearn.svm import SVR
-from tensorflow.keras.layers import Input, Conv1D, Add, LayerNormalization, Dense, Dropout, Bidirectional, GRU, Layer
-from tensorflow.keras.models import Model
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-from tensorflow.keras.activations import swish
 
 def uniform_noise(features):
     noise = np.random.uniform(-0.02, 0.02, features.shape) * features
@@ -209,11 +207,11 @@ class LGBM:
         self.X_seq = X_seq
         best_score = float('inf')
         self.param_grid = {
-            'num_leaves': [75, 100, 125],
+            'num_leaves': [50, 100, 150],
             'learning_rate': [self.learning_rate],
             'max_depth': [-1, 5, 10],
-            'min_data_in_leaf': [10, 20, 30],
-            'feature_fraction': [0.4, 0.5, 0.6],
+            'min_data_in_leaf': [5, 15, 25],
+            'feature_fraction': [0.4, 0.6, 0.8],
             'min_gain_to_split': [self.regularization_param],
             'bagging_fraction': [0.9],
             'bagging_freq': [1]
@@ -301,114 +299,126 @@ class LGBM:
         forecast = self.data_prep.inverse_transform_y(forecast_scaled)
         return forecast[0]
 
-class TFT_GRU:
-    def __init__(self, time_steps=40, sequence_length=4, learning_rate=0.07, clipnorm=0.1):
+class TFT_GRU(nn.Module):
+    def __init__(self, time_steps=40, sequence_length=5, learning_rate=0.07, clipnorm=0.1):
+        super(TFT_GRU, self).__init__()
         self.time_steps = time_steps
         self.sequence_length = sequence_length
         self.learning_rate = learning_rate
         self.clipnorm = clipnorm
-        self.model = None
+        self.model_built = False
         self.data_prep = DataPreparation(self.sequence_length)
         self.validator = WalkForwardValidation(self.sequence_length)
-        self.X_seq = None
+        self.optimizer = None
 
-    class AttentionLayer(Layer):
-        def __init__(self, head_size, num_heads, **kwargs):
-            super().__init__(**kwargs)
-            self.head_size = head_size
-            self.num_heads = num_heads
+    def build_model(self, input_shape):
+        self.conv1 = nn.Conv1d(in_channels=input_shape, out_channels=64, kernel_size=2, padding='same')
+        self.conv2 = nn.Conv1d(in_channels=64, out_channels=64, kernel_size=2, padding='same')
 
-        def build(self, input_shape):
-            self.query_dense = Dense(self.head_size * self.num_heads)
-            self.key_dense = Dense(self.head_size * self.num_heads)
-            self.value_dense = Dense(self.head_size * self.num_heads)
-            self.output_dense = Dense(input_shape[-1])
+        self.query_dense = nn.Linear(64, 64)
+        self.key_dense = nn.Linear(64, 64)
+        self.value_dense = nn.Linear(64, 64)
+        self.output_dense = nn.Linear(64, 64)
 
-        def call(self, inputs):
-            query = self.query_dense(inputs)
-            key = self.key_dense(inputs)
-            value = self.value_dense(inputs)
+        # Layer normalization and residual connections
+        self.layernorm1 = nn.LayerNorm(64)
+        self.layernorm2 = nn.LayerNorm(64)
 
-            query = tf.split(query, self.num_heads, axis=-1)
-            key = tf.split(key, self.num_heads, axis=-1)
-            value = tf.split(value, self.num_heads, axis=-1)
+        # Fully connected layers and dropout
+        self.fc1 = nn.Linear(64, 64)
+        self.dropout1 = nn.Dropout(0.2)
 
-            attention_outputs = []
-            for q, k, v in zip(query, key, value):
-                attention_score = tf.matmul(q, k, transpose_b=True) / tf.sqrt(tf.cast(self.head_size, tf.float32))
-                attention_weights = tf.nn.softmax(attention_score, axis=-1)
-                attention_output = tf.matmul(attention_weights, v)
-                attention_outputs.append(attention_output)
+        # GRU layers
+        self.gru1 = nn.GRU(input_size=64, hidden_size=64, batch_first=True, bidirectional=True)
+        self.layernorm3 = nn.LayerNorm(128)
+        self.dropout2 = nn.Dropout(0.2)
+        self.gru2 = nn.GRU(input_size=128, hidden_size=32, batch_first=True, bidirectional=True)
+        self.layernorm4 = nn.LayerNorm(64)
+        self.dropout3 = nn.Dropout(0.2)
 
-            concat_attention = tf.concat(attention_outputs, axis=-1)
-            output = self.output_dense(concat_attention)
+        # Final dense layers
+        self.fc2 = nn.Linear(64, 32)
+        self.fc3 = nn.Linear(32, 1)
 
-            return output
+        self.optimizer = optim.Adam(self.parameters(), lr=self.learning_rate)
+        self.model_built = True
 
-    def build_model(self, input_shape, sequence_length):
-        inputs = Input(shape=(sequence_length, input_shape))
+    def attention_layer(self, inputs, head_size, num_heads):
+        batch_size, seq_len, _ = inputs.size()
 
-        adjusted_inputs = Conv1D(filters=64, kernel_size=2, padding='same', activation='swish')(inputs)
-        attention = self.AttentionLayer(head_size=16, num_heads=4)(adjusted_inputs)
-        attention = Conv1D(filters=64, kernel_size=2, padding='same', activation='swish')(attention)
-        x = Add()([adjusted_inputs, attention])
-        x = LayerNormalization()(x)
-        x = Dense(64, activation='swish')(x)
-        x = Dropout(0.2)(x)
-        x = Add()([adjusted_inputs, x])
-        x = LayerNormalization()(x)
+        # Apply linear projections to generate query, key, and value
+        query = self.query_dense(inputs)
+        key = self.key_dense(inputs)
+        value = self.value_dense(inputs)
 
-        x = Bidirectional(GRU(64, activation='swish', recurrent_activation='sigmoid', return_sequences=True))(x)
-        x = LayerNormalization()(x)
-        x = Dropout(0.2)(x)
-        x = Bidirectional(GRU(32, activation='swish', recurrent_activation='sigmoid', return_sequences=False))(x)
-        x = LayerNormalization()(x)
-        x = Dropout(0.2)(x)
+        # Split the query, key, and value into multiple heads
+        query = query.view(batch_size, seq_len, num_heads, head_size).permute(0, 2, 1, 3)
+        key = key.view(batch_size, seq_len, num_heads, head_size).permute(0, 2, 1, 3)
+        value = value.view(batch_size, seq_len, num_heads, head_size).permute(0, 2, 1, 3)
 
-        x = Dense(32, activation='swish')(x)
-        output = Dense(1)(x)
+        # Calculate attention for each head
+        attention_scores = torch.matmul(query, key.transpose(-2, -1)) / torch.sqrt(torch.tensor(head_size, dtype=torch.float32))
+        attention_weights = F.softmax(attention_scores, dim=-1)
+        attention_output = torch.matmul(attention_weights, value)
 
-        optimizer = Adam(learning_rate=self.learning_rate, clipnorm=self.clipnorm)
-        self.model = Model(inputs=inputs, outputs=output)
-        self.model.compile(optimizer=optimizer, loss='mean_absolute_error')
-    
-    def cleanup(self):
-        """Clean up all resources"""
-        if self.model is not None:
-            del self.model
-            self.model = None
-        if hasattr(self, 'data_prep') and self.data_prep is not None:
-            self.data_prep = None
-        if hasattr(self, 'validator') and self.validator is not None:
-            self.validator = None
-        if self.X_seq is not None:
-            del self.X_seq
-            self.X_seq = None
+        # Concatenate all the attention outputs
+        concat_attention = attention_output.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_len, -1)
 
-        tf.keras.backend.clear_session(free_memory=True)
-        gc.collect()
+        # Apply a final linear layer with Swish activation to match the original input size
+        output = self.output_dense(concat_attention)
+        output = F.silu(output)  # Swish activation function
 
-    def fit(self, X, y):
-        # Ensure the usage of GPU if available
-        gpus = tf.config.experimental.list_physical_devices('GPU')
-        if gpus:
-            try:
-                tf.config.experimental.set_memory_growth(gpus[0], True)
-                tf.config.optimizer.set_jit(False)  # Disable XLA if not needed
-            except RuntimeError as e:
-                print(e)
+        return output
 
+    def forward(self, x):
+        if not self.model_built:
+            self.build_model(input_shape=x.shape[2])
+
+        x = x.transpose(1, 2)
+        x1 = F.silu(self.conv1(x)).transpose(1, 2)
+
+        # Attention mechanism
+        attention_output = self.attention_layer(x1, head_size=16, num_heads=4)
+        attention_output = F.silu(self.conv2(attention_output.transpose(1, 2)).transpose(1, 2))
+
+        # Residual connections and normalization
+        x1 = self.add_and_norm(x1, attention_output, self.layernorm1)
+        x2 = F.silu(self.fc1(x1))
+        x2 = self.dropout1(x2)
+        x2 = self.add_and_norm(x1, x2, self.layernorm2)
+
+        # Bidirectional GRUs
+        x3, _ = self.gru1(x2)
+        x3 = self.layernorm3(x3)
+        x3 = self.dropout2(x3)
+        x4, _ = self.gru2(x3)
+        x4 = self.layernorm4(x4)
+        x4 = self.dropout3(x4)
+
+        x5 = F.silu(self.fc2(x4))
+        output = self.fc3(x5)
+
+        # Return the last time step for each sequence
+        return output[:, -1, :].squeeze(-1)
+
+    def add_and_norm(self, x1, x2, layernorm):
+        x = x1 + x2
+        x = layernorm(x)
+        return x
+
+    def fit(self, X, y, batch_size=64, epochs=15):
         # Create sequences
         X_seq, y_seq = self.data_prep.create_sequences(X, y, is_3d=True)
-        self.X_seq = np.array(X_seq)
-        
-        # Ensure model is built
-        if self.model is None:
-            self.build_model(X_seq.shape[-1], self.sequence_length)
+        self.X_seq = X_seq
 
-        # Callbacks
-        early_stopping = EarlyStopping(monitor='loss', patience=5, restore_best_weights=True)
-        reduce_lr = ReduceLROnPlateau(monitor='loss', factor=0.5, patience=2, min_lr=0.001)
+        # Check if the sequence creation was successful
+        if X_seq.size == 0 or y_seq.size == 0:
+            print("Sequence creation failed. Not enough data points.")
+            return
+
+        # Ensure model is built
+        if not self.model_built:
+            self.build_model(input_shape=X_seq.shape[-1])
 
         # Walk-forward validation
         for i, ((X_train, y_train), (X_test, y_test)) in enumerate(self.validator.validate(X_seq, y_seq)):
@@ -420,43 +430,69 @@ class TFT_GRU:
             X_train_scaled, y_train_scaled = self.data_prep.scale_data(X_train_noised, y_train)
             X_test_scaled, y_test_scaled = self.data_prep.scale_data(X_test, y_test)
 
-            # Train model
-            with tf.device('/device:GPU:0'):
-                self.model.fit(
-                    X_train_scaled, y_train_scaled,
-                    validation_data=(X_test_scaled, y_test_scaled),
-                    epochs=15, batch_size=64, verbose=1,
-                    callbacks=[early_stopping, reduce_lr]
-                )
+            # Convert pandas Series to numpy arrays
+            y_train_scaled = y_train_scaled.to_numpy().flatten()
+            y_test_scaled = y_test_scaled.to_numpy().flatten()
 
-            # Validation MAE
-            y_pred_scaled = self.model.predict(X_test_scaled)
-            y_pred = self.data_prep.inverse_transform_y(pd.Series(y_pred_scaled.flatten())).to_numpy().flatten()
-            y_test_original = y_test.to_numpy().flatten()
-            mae = mean_absolute_error(y_test_original, y_pred)
-            print(f"Step {i+1} Validation MAE: {mae}")
+            # Prepare the dataset and dataloader for training
+            train_dataset = TensorDataset(torch.tensor(X_train_scaled, dtype=torch.float32), torch.tensor(y_train_scaled, dtype=torch.float32))
+            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
-        # final training
+            # Training loop
+            self.train()
+            for epoch in range(epochs):
+                epoch_loss = 0
+                for batch_X, batch_y in train_loader:
+                    self.optimizer.zero_grad()
+                    output = self.forward(batch_X)
+                    loss = nn.functional.l1_loss(output, batch_y)
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(self.parameters(), self.clipnorm)
+                    self.optimizer.step()
+                    epoch_loss += loss.item()
+                print(f'Step {i+1} Epoch {epoch+1}/{epochs}, Loss: {epoch_loss/len(train_loader)}')
+
+            # Validation
+            self.eval()
+            with torch.no_grad():
+                X_test_tensor = torch.tensor(X_test_scaled, dtype=torch.float32)
+                y_pred_scaled = self.forward(X_test_tensor).cpu().numpy().flatten()
+                y_pred = self.data_prep.inverse_transform_y(pd.Series(y_pred_scaled)).to_numpy().flatten()
+                y_test_original = y_test.to_numpy().flatten()
+                mae = mean_absolute_error(y_test_original, y_pred)
+                print(f"Step {i+1} Validation MAE: {mae}")
+
+        # Final training with all data
         X_seq_noised = uniform_noise(X_seq)
         X_seq_scaled, y_seq_scaled = self.data_prep.scale_data(X_seq_noised, y_seq)
-        with tf.device('/device:GPU:0'):
-            self.model.fit(
-                X_seq_scaled, y_seq_scaled,
-                epochs=15, batch_size=64, verbose=1,
-                callbacks=[early_stopping, reduce_lr]
-            )
+        y_seq_scaled = y_seq_scaled.to_numpy().flatten()  # Ensure y_seq_scaled is a numpy array
+        train_dataset = TensorDataset(torch.tensor(X_seq_scaled, dtype=torch.float32), torch.tensor(y_seq_scaled, dtype=torch.float32))
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+        self.train()
+        for epoch in range(epochs):
+            epoch_loss = 0
+            for batch_X, batch_y in train_loader:
+                self.optimizer.zero_grad()
+                output = self.forward(batch_X)
+                loss = nn.functional.l1_loss(output, batch_y)
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.parameters(), self.clipnorm)
+                self.optimizer.step()
+                epoch_loss += loss.item()
+            print(f'Final Training Epoch {epoch+1}/{epochs}, Loss: {epoch_loss/len(train_loader)}')
 
     def predict(self):
+        if not self.model_built:
+            raise AttributeError("Model has not been fitted yet.")
         X_input = self.X_seq[-1].reshape(1, self.sequence_length, -1)
         X_input_scaled = self.data_prep.scaler_X.transform(X_input.reshape(-1, X_input.shape[-1])).reshape(1, self.sequence_length, -1)
-        with tf.device('/device:GPU:0'):
-            forecast_scaled = self.model.predict(X_input_scaled)
-        forecast = self.data_prep.inverse_transform_y(forecast_scaled)
+        X_input_tensor = torch.tensor(X_input_scaled, dtype=torch.float32)
 
-        del X_input, X_input_scaled, forecast_scaled
-        gc.collect()
-        self.cleanup()
-        gc.collect()
+        with torch.no_grad():
+            forecast_scaled = self.forward(X_input_tensor).cpu().numpy()
+
+        forecast = self.data_prep.inverse_transform_y(pd.Series(forecast_scaled.flatten())).to_numpy()
 
         return forecast[0]
 
