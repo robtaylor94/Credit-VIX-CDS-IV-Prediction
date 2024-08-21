@@ -1,8 +1,6 @@
-## Final tests will be done on 2024 data.
-
 MSc Project
 
-Estimation of Implied Vol levels with the following predictors:
+## Estimation of Implied Vol levels with the following predictors:
 
 ### Random Forest Rankings for Financial Instruments
 
