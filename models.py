@@ -5,7 +5,6 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import itertools
-import gc
 import lightgbm as lgb
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.feature_selection import SelectKBest, f_regression
@@ -299,10 +298,9 @@ class LGBM:
         forecast = self.data_prep.inverse_transform_y(forecast_scaled)
         return forecast[0]
 
-class TFT_GRU(nn.Module):
-    def __init__(self, time_steps=40, sequence_length=5, learning_rate=0.07, clipnorm=0.1):
-        super(TFT_GRU, self).__init__()
-        self.time_steps = time_steps
+class ATTN_GRU(nn.Module):
+    def __init__(self, sequence_length=5, learning_rate=0.08, clipnorm=0.1):
+        super(ATTN_GRU, self).__init__()
         self.sequence_length = sequence_length
         self.learning_rate = learning_rate
         self.clipnorm = clipnorm
@@ -320,15 +318,12 @@ class TFT_GRU(nn.Module):
         self.value_dense = nn.Linear(64, 64)
         self.output_dense = nn.Linear(64, 64)
 
-        # Layer normalization and residual connections
         self.layernorm1 = nn.LayerNorm(64)
         self.layernorm2 = nn.LayerNorm(64)
 
-        # Fully connected layers and dropout
         self.fc1 = nn.Linear(64, 64)
         self.dropout1 = nn.Dropout(0.2)
 
-        # GRU layers
         self.gru1 = nn.GRU(input_size=64, hidden_size=64, batch_first=True, bidirectional=True)
         self.layernorm3 = nn.LayerNorm(128)
         self.dropout2 = nn.Dropout(0.2)
@@ -336,11 +331,11 @@ class TFT_GRU(nn.Module):
         self.layernorm4 = nn.LayerNorm(64)
         self.dropout3 = nn.Dropout(0.2)
 
-        # Final dense layers
         self.fc2 = nn.Linear(64, 32)
         self.fc3 = nn.Linear(32, 1)
 
-        self.optimizer = optim.Adam(self.parameters(), lr=self.learning_rate)
+        self.optimizer = optim.AdamW(self.parameters(), lr=self.learning_rate)
+        
         self.model_built = True
 
     def attention_layer(self, inputs, head_size, num_heads):
@@ -356,12 +351,10 @@ class TFT_GRU(nn.Module):
         key = key.view(batch_size, seq_len, num_heads, head_size).permute(0, 2, 1, 3)
         value = value.view(batch_size, seq_len, num_heads, head_size).permute(0, 2, 1, 3)
 
-        # Calculate attention for each head
         attention_scores = torch.matmul(query, key.transpose(-2, -1)) / torch.sqrt(torch.tensor(head_size, dtype=torch.float32))
         attention_weights = F.softmax(attention_scores, dim=-1)
         attention_output = torch.matmul(attention_weights, value)
 
-        # Concatenate all the attention outputs
         concat_attention = attention_output.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_len, -1)
 
         # Apply a final linear layer with Swish activation to match the original input size
@@ -377,17 +370,16 @@ class TFT_GRU(nn.Module):
         x = x.transpose(1, 2)
         x1 = F.silu(self.conv1(x)).transpose(1, 2)
 
-        # Attention mechanism
+        # attention mechanism
         attention_output = self.attention_layer(x1, head_size=16, num_heads=4)
         attention_output = F.silu(self.conv2(attention_output.transpose(1, 2)).transpose(1, 2))
 
-        # Residual connections and normalization
+        # residual connections and normalisation
         x1 = self.add_and_norm(x1, attention_output, self.layernorm1)
         x2 = F.silu(self.fc1(x1))
         x2 = self.dropout1(x2)
         x2 = self.add_and_norm(x1, x2, self.layernorm2)
 
-        # Bidirectional GRUs
         x3, _ = self.gru1(x2)
         x3 = self.layernorm3(x3)
         x3 = self.dropout2(x3)
@@ -398,7 +390,6 @@ class TFT_GRU(nn.Module):
         x5 = F.silu(self.fc2(x4))
         output = self.fc3(x5)
 
-        # Return the last time step for each sequence
         return output[:, -1, :].squeeze(-1)
 
     def add_and_norm(self, x1, x2, layernorm):
@@ -406,39 +397,34 @@ class TFT_GRU(nn.Module):
         x = layernorm(x)
         return x
 
-    def fit(self, X, y, batch_size=64, epochs=15):
-        # Create sequences
+    def fit(self, X, y, batch_size=32, epochs=50, patience=4):
         X_seq, y_seq = self.data_prep.create_sequences(X, y, is_3d=True)
         self.X_seq = X_seq
 
-        # Check if the sequence creation was successful
         if X_seq.size == 0 or y_seq.size == 0:
             print("Sequence creation failed. Not enough data points.")
             return
 
-        # Ensure model is built
         if not self.model_built:
             self.build_model(input_shape=X_seq.shape[-1])
 
-        # Walk-forward validation
         for i, ((X_train, y_train), (X_test, y_test)) in enumerate(self.validator.validate(X_seq, y_seq)):
             if len(X_train) == 0 or len(X_test) == 0:
                 continue
 
-            # Add noise and scale data
             X_train_noised = uniform_noise(X_train)
             X_train_scaled, y_train_scaled = self.data_prep.scale_data(X_train_noised, y_train)
             X_test_scaled, y_test_scaled = self.data_prep.scale_data(X_test, y_test)
 
-            # Convert pandas Series to numpy arrays
             y_train_scaled = y_train_scaled.to_numpy().flatten()
             y_test_scaled = y_test_scaled.to_numpy().flatten()
 
-            # Prepare the dataset and dataloader for training
             train_dataset = TensorDataset(torch.tensor(X_train_scaled, dtype=torch.float32), torch.tensor(y_train_scaled, dtype=torch.float32))
             train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
-            # Training loop
+            best_val_loss = np.inf
+            patience_counter = 0
+
             self.train()
             for epoch in range(epochs):
                 epoch_loss = 0
@@ -450,24 +436,39 @@ class TFT_GRU(nn.Module):
                     nn.utils.clip_grad_norm_(self.parameters(), self.clipnorm)
                     self.optimizer.step()
                     epoch_loss += loss.item()
+
                 print(f'Step {i+1} Epoch {epoch+1}/{epochs}, Loss: {epoch_loss/len(train_loader)}')
 
-            # Validation
-            self.eval()
-            with torch.no_grad():
-                X_test_tensor = torch.tensor(X_test_scaled, dtype=torch.float32)
-                y_pred_scaled = self.forward(X_test_tensor).cpu().numpy().flatten()
-                y_pred = self.data_prep.inverse_transform_y(pd.Series(y_pred_scaled)).to_numpy().flatten()
-                y_test_original = y_test.to_numpy().flatten()
-                mae = mean_absolute_error(y_test_original, y_pred)
-                print(f"Step {i+1} Validation MAE: {mae}")
+                # Validation
+                self.eval()
+                with torch.no_grad():
+                    X_test_tensor = torch.tensor(X_test_scaled, dtype=torch.float32)
+                    y_pred_scaled = self.forward(X_test_tensor).cpu().numpy().flatten()
+                    y_pred = self.data_prep.inverse_transform_y(pd.Series(y_pred_scaled)).to_numpy().flatten()
+                    y_test_original = y_test.to_numpy().flatten()
+                    val_mae = mean_absolute_error(y_test_original, y_pred)
 
-        # Final training with all data
+                print(f"Step {i+1} Validation MAE: {val_mae}")
+
+                if val_mae < best_val_loss:
+                    best_val_loss = val_mae
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+
+                if patience_counter >= patience:
+                    print(f"Early stopping at epoch {epoch+1} for Step {i+1}. Best Validation MAE: {best_val_loss}")
+                    break
+
+        # final training with all data
         X_seq_noised = uniform_noise(X_seq)
         X_seq_scaled, y_seq_scaled = self.data_prep.scale_data(X_seq_noised, y_seq)
-        y_seq_scaled = y_seq_scaled.to_numpy().flatten()  # Ensure y_seq_scaled is a numpy array
+        y_seq_scaled = y_seq_scaled.to_numpy().flatten()
         train_dataset = TensorDataset(torch.tensor(X_seq_scaled, dtype=torch.float32), torch.tensor(y_seq_scaled, dtype=torch.float32))
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+        best_final_loss = best_val_loss
+        patience_counter = 0
 
         self.train()
         for epoch in range(epochs):
@@ -480,7 +481,18 @@ class TFT_GRU(nn.Module):
                 nn.utils.clip_grad_norm_(self.parameters(), self.clipnorm)
                 self.optimizer.step()
                 epoch_loss += loss.item()
+
             print(f'Final Training Epoch {epoch+1}/{epochs}, Loss: {epoch_loss/len(train_loader)}')
+
+            if epoch_loss < best_final_loss:
+                best_final_loss = epoch_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if patience_counter >= patience:
+                print(f"Early stopping during final training at epoch {epoch+1}. Best Final Loss: {best_final_loss/len(train_loader)}")
+                break
 
     def predict(self):
         if not self.model_built:
