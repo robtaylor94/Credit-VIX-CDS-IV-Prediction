@@ -299,7 +299,7 @@ class LGBM:
         return forecast[0]
 
 class ATTN_GRU(nn.Module):
-    def __init__(self, sequence_length=5, learning_rate=0.08, clipnorm=0.1):
+    def __init__(self, sequence_length=5, learning_rate=0.07, clipnorm=0.1):
         super(ATTN_GRU, self).__init__()
         self.sequence_length = sequence_length
         self.learning_rate = learning_rate
@@ -334,7 +334,7 @@ class ATTN_GRU(nn.Module):
         self.fc2 = nn.Linear(64, 32)
         self.fc3 = nn.Linear(32, 1)
 
-        self.optimizer = optim.AdamW(self.parameters(), lr=self.learning_rate)
+        self.optimizer = optim.Adam(self.parameters(), lr=self.learning_rate)
         
         self.model_built = True
 
